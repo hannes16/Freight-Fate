@@ -39,7 +39,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Mirror the source commit into this fork
+      - name: Record the upstream source commit
         id: source
         shell: bash
         env:
@@ -50,19 +50,18 @@ jobs:
           SOURCE_SHA=$(git rev-parse HEAD)
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
-          git remote add fork \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          FORK_SHA=$(git ls-remote fork refs/heads/snapshot-source | cut -f1)
-
-          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$FORK_SHA" == "$SOURCE_SHA" ]]; then
-            echo "Upstream has not changed since the previous snapshot."
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            # Release notes carry the complete upstream SHA. Do not create a
+            # fork branch just to remember it: an Actions token can be blocked
+            # from pushing upstream commits that contain workflow files.
+            RELEASE_BODIES=$(gh release list --repo "$GITHUB_REPOSITORY" \
+              --limit 20 --json body --jq '.[].body' || true)
+            if grep -Fq "$SOURCE_SHA" <<< "$RELEASE_BODIES"; then
+              echo "Upstream has not changed since the previous snapshot."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
-
-          # This updates only hannes16/Freight-Fate. The upstream remote is
-          # read-only and is never a push target.
-          git push fork HEAD:refs/heads/snapshot-source --force
 
           echo "should_build=true" >> "$GITHUB_OUTPUT"
           echo "tag=nightly-$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
@@ -204,7 +203,7 @@ jobs:
         run: |
           gh release create "$TAG" assets/* \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_SHA" \
+            --target main \
             --title "Personal developer snapshot $(date -u +%Y-%m-%d)" \
             --notes-file notes.md \
             --prerelease
