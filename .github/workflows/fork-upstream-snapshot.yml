@@ -1,0 +1,210 @@
+name: Fork snapshot from upstream 1.9
+
+# Keep this workflow on the fork's default branch. Scheduled workflows are
+# loaded from the default branch even though the game source below comes from
+# the upstream 1.9 branch.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-upstream-snapshot
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  UPSTREAM_REPOSITORY: Orinks/Freight-Fate
+  UPSTREAM_BRANCH: feat/career-1.9
+  UPDATE_REPOSITORY: hannes16/Freight-Fate
+
+jobs:
+  prepare:
+    name: Pull upstream source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.source.outputs.should_build }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - name: Check out the upstream 1.9 branch
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_BRANCH }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Mirror the source commit into this fork
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          SOURCE_SHA=$(git rev-parse HEAD)
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+          git remote add fork \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          FORK_SHA=$(git ls-remote fork refs/heads/snapshot-source | cut -f1)
+
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" && "$FORK_SHA" == "$SOURCE_SHA" ]]; then
+            echo "Upstream has not changed since the previous snapshot."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # This updates only hannes16/Freight-Fate. The upstream remote is
+          # read-only and is never a push target.
+          git push fork HEAD:refs/heads/snapshot-source --force
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Windows snapshot
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact upstream commit
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 1
+          lfs: true
+          persist-credentials: false
+
+      - name: Point this packaged copy at fork releases
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ env.UPDATE_REPOSITORY }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("src/freight_fate/updater.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_repository = 'REPO = "Orinks/Freight-fate"'
+          new_repository = f'REPO = "{os.environ["EXPECTED_REPOSITORY"]}"'
+          if text.count(old_repository) != 1:
+              raise SystemExit("Could not safely locate the upstream updater repository setting")
+          text = text.replace(old_repository, new_repository)
+
+          # A fork snapshot can be rebuilt more than once on the same day.
+          # Teach this packaged copy to recognize the timestamped tag while
+          # retaining compatibility with upstream's daily nightly tags.
+          old_pattern = 'm = re.fullmatch(r"nightly-(\\d{8})", tag)'
+          new_pattern = 'm = re.fullmatch(r"nightly-(\\d{8})(?:-\\d{6})?", tag)'
+          if old_pattern in text:
+              text = text.replace(old_pattern, new_pattern, 1)
+          elif new_pattern not in text:
+              raise SystemExit("Could not safely update the nightly tag parser")
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build dependencies
+        run: uv sync --group build
+
+      - name: Verify the personalized update source
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: ${{ env.UPDATE_REPOSITORY }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          from freight_fate import updater
+
+          assert updater.REPO == os.environ["EXPECTED_REPOSITORY"]
+          build = updater.build_info_from_dict(
+              {"tag": "nightly-20260822-120000"}, "1.9.0.dev0"
+          )
+          assert build.channel == "dev"
+          PY
+
+      - name: Check release dependencies
+        run: uv run python tools/build_release.py --check-dependencies
+
+      - name: Build snapshot
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+          FREIGHT_FATE_NO_SPEECH: "1"
+        run: >
+          uv run python tools/build_release.py
+          --tag "${{ needs.prepare.outputs.tag }}"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: Windows
+          path: dist/FreightFate-*-windows-portable.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish snapshot in this fork
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download platform archives
+        uses: actions/download-artifact@v7
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Verify archives and write release notes
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ env.UPSTREAM_BRANCH }}
+          UPSTREAM_REPOSITORY: ${{ env.UPSTREAM_REPOSITORY }}
+        run: |
+          set -euo pipefail
+
+          if ! ls assets/FreightFate-*-windows-portable.zip >/dev/null 2>&1; then
+            echo "Missing Windows portable archive" >&2
+            exit 1
+          fi
+
+          (cd assets && sha256sum * > checksums.txt)
+          SHORT_SHA=${SOURCE_SHA:0:12}
+          {
+            echo "Personal developer snapshot built from upstream."
+            echo
+            echo "Upstream branch: \`${SOURCE_BRANCH}\`"
+            echo "Upstream commit: [\`${SHORT_SHA}\`](https://github.com/${UPSTREAM_REPOSITORY}/commit/${SOURCE_SHA})"
+            echo
+            echo "This release belongs to the fork and does not modify the upstream repository."
+          } > notes.md
+
+      - name: Create prerelease in this fork
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release create "$TAG" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "Personal developer snapshot $(date -u +%Y-%m-%d)" \
+            --notes-file notes.md \
+            --prerelease
