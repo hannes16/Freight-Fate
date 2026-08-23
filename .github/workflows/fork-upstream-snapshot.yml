@@ -296,6 +296,19 @@ jobs:
           if [[ -n "$PREVIOUS_TAG" ]]; then
             gh release view "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" \
               --json body --jq .body > previous-notes.md || true
+
+            # Re-read the source SHA here instead of trusting only a cross-job
+            # output. Without a usable baseline release_notes.py deliberately
+            # emits every unreleased entry, which can exceed GitHub's body limit.
+            if [[ -z "$PREVIOUS_SHA" ]]; then
+              PREVIOUS_SHA=$(grep -Eom1 \
+                'upstream-source-sha: [0-9a-fA-F]{40}|/commit/[0-9a-fA-F]{40}' \
+                previous-notes.md | grep -Eo '[0-9a-fA-F]{40}$' || true)
+            fi
+            if [[ -z "$PREVIOUS_SHA" ]]; then
+              echo "Could not recover the upstream SHA from snapshot $PREVIOUS_TAG" >&2
+              exit 1
+            fi
           fi
 
           : > latest-stable-notes.md
@@ -308,12 +321,12 @@ jobs:
 
           BASE_ARGS=()
           if [[ -n "$PREVIOUS_SHA" ]]; then
-            if ! git cat-file -e "${PREVIOUS_SHA}^{commit}" 2>/dev/null; then
-              git fetch --no-tags origin "$PREVIOUS_SHA" || true
-            fi
-            if git cat-file -e "${PREVIOUS_SHA}^{commit}" 2>/dev/null; then
-              BASE_ARGS=(--previous-tag "$PREVIOUS_SHA")
-            fi
+            git fetch --no-tags origin "$PREVIOUS_SHA"
+            # release_notes.py treats an unreadable historical changelog as an
+            # empty baseline. Prove the blob is materialized before invoking it
+            # so a partial checkout cannot advertise the entire changelog.
+            git show "${PREVIOUS_SHA}:CHANGELOG.md" >/dev/null
+            BASE_ARGS=(--previous-tag "$PREVIOUS_SHA")
           fi
 
           python3 tools/release_notes.py nightly \
@@ -321,6 +334,13 @@ jobs:
             --exclude-notes previous-notes.md \
             --exclude-stable-notes latest-stable-notes.md \
             --output notes.md
+
+          NOTES_BYTES=$(wc -c < notes.md)
+          if (( NOTES_BYTES > 120000 )); then
+            echo "Generated release notes are unexpectedly large: ${NOTES_BYTES} bytes" >&2
+            exit 1
+          fi
+          echo "Generated ${NOTES_BYTES} bytes of updater-compatible release notes."
 
           SHORT_SHA=${SOURCE_SHA:0:12}
           {
