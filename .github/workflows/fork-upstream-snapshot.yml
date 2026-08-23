@@ -29,6 +29,7 @@ jobs:
     outputs:
       should_build: ${{ steps.source.outputs.should_build }}
       source_sha: ${{ steps.source.outputs.source_sha }}
+      previous_sha: ${{ steps.source.outputs.previous_sha }}
       tag: ${{ steps.source.outputs.tag }}
     steps:
       - name: Check out the upstream 1.9 branch
@@ -50,12 +51,17 @@ jobs:
           SOURCE_SHA=$(git rev-parse HEAD)
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
+          # The newest snapshot release is the baseline for both duplicate
+          # detection and its eventual changelog. Support the original release
+          # note format as well as the durable marker written by new runs.
+          RELEASE_BODIES=$(gh release list --repo "$GITHUB_REPOSITORY" \
+            --limit 100 --json body --jq '.[].body' || true)
+          PREVIOUS_SHA=$(grep -Eom1 \
+            'upstream-source-sha: [0-9a-fA-F]{40}|/commit/[0-9a-fA-F]{40}' \
+            <<< "$RELEASE_BODIES" | grep -Eo '[0-9a-fA-F]{40}$' || true)
+          echo "previous_sha=${PREVIOUS_SHA,,}" >> "$GITHUB_OUTPUT"
+
           if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
-            # Release notes carry the complete upstream SHA. Do not create a
-            # fork branch just to remember it: an Actions token can be blocked
-            # from pushing upstream commits that contain workflow files.
-            RELEASE_BODIES=$(gh release list --repo "$GITHUB_REPOSITORY" \
-              --limit 20 --json body --jq '.[].body' || true)
             if grep -Fq "$SOURCE_SHA" <<< "$RELEASE_BODIES"; then
               echo "Upstream has not changed since the previous snapshot."
               echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -247,6 +253,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Check out upstream history for the changelog
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 0
+          lfs: false
+          persist-credentials: false
+
       - name: Download platform archives
         uses: actions/download-artifact@v7
         with:
@@ -257,6 +272,7 @@ jobs:
         shell: bash
         env:
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          PREVIOUS_SHA: ${{ needs.prepare.outputs.previous_sha }}
           SOURCE_BRANCH: ${{ env.UPSTREAM_BRANCH }}
           UPSTREAM_REPOSITORY: ${{ env.UPSTREAM_REPOSITORY }}
         run: |
@@ -274,6 +290,49 @@ jobs:
             echo
             echo "Upstream branch: \`${SOURCE_BRANCH}\`"
             echo "Upstream commit: [\`${SHORT_SHA}\`](https://github.com/${UPSTREAM_REPOSITORY}/commit/${SOURCE_SHA})"
+            echo "<!-- upstream-source-sha: ${SOURCE_SHA} -->"
+            echo
+
+            echo "## Changes since the previous snapshot"
+            echo
+            if [[ -z "$PREVIOUS_SHA" ]]; then
+              echo "This is the first snapshot with a recorded upstream baseline."
+            elif [[ "$PREVIOUS_SHA" == "$SOURCE_SHA" ]]; then
+              echo "No upstream source changes; this is a rebuild of the same commit."
+            else
+              # A previous snapshot can refer to a commit no longer reachable
+              # after an upstream force-push, so fetch it explicitly when needed.
+              if ! git cat-file -e "${PREVIOUS_SHA}^{commit}" 2>/dev/null; then
+                git fetch --no-tags origin "$PREVIOUS_SHA" || true
+              fi
+
+              if git cat-file -e "${PREVIOUS_SHA}^{commit}" 2>/dev/null; then
+                PREVIOUS_SHORT=${PREVIOUS_SHA:0:12}
+                echo "Compare: [\`${PREVIOUS_SHORT}...${SHORT_SHA}\`](https://github.com/${UPSTREAM_REPOSITORY}/compare/${PREVIOUS_SHA}...${SOURCE_SHA})"
+                echo
+                echo "### Upstream commits"
+                echo
+                if git merge-base --is-ancestor "$PREVIOUS_SHA" "$SOURCE_SHA"; then
+                  git log --reverse --format="- [\`%h\`](https://github.com/${UPSTREAM_REPOSITORY}/commit/%H) %s" \
+                    "${PREVIOUS_SHA}..${SOURCE_SHA}"
+                else
+                  echo "Upstream history was rewritten; showing commits unique to this snapshot."
+                  echo
+                  git log --reverse --format="- [\`%h\`](https://github.com/${UPSTREAM_REPOSITORY}/commit/%H) %s" \
+                    "$SOURCE_SHA" --not "$PREVIOUS_SHA"
+                fi
+                echo
+                echo "<details>"
+                echo "<summary>Changed files</summary>"
+                echo
+                echo '```text'
+                git diff --stat "$PREVIOUS_SHA" "$SOURCE_SHA"
+                echo '```'
+                echo "</details>"
+              else
+                echo "Previous upstream commit \`${PREVIOUS_SHA}\` is no longer available; a reliable diff could not be generated."
+              fi
+            fi
             echo
             echo "This release belongs to the fork and does not modify the upstream repository."
           } > notes.md
